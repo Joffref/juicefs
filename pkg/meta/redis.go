@@ -316,7 +316,7 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 	writeTimeout := query.duration("write-timeout", "write_timeout", time.Second*5)
 	routeRead := query.pop("route-read")
 	skipVerify := query.pop("insecure-skip-verify")
-	enablePipelining := query.pop("enable-pipelining") != "" // Enable with ?enable-pipelining=true
+	enablePipelining := true // Enable with ?enable-pipelining=true
 	certFile := query.pop("tls-cert-file")
 	keyFile := query.pop("tls-key-file")
 	caCertFile := query.pop("tls-ca-cert-file")
