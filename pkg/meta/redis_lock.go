@@ -39,13 +39,15 @@ func (r *redisMeta) Flock(ctx Context, inode Ino, owner uint64, ltype uint32, bl
 			if err != nil {
 				return err
 			}
-			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-				pipe.HDel(ctx, ikey, lkey)
-				if len(lkeys) == 1 && lkeys[0] == lkey {
+			if len(lkeys) == 1 && lkeys[0] == lkey {
+				_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+					pipe.HDel(ctx, ikey, lkey)
 					pipe.SRem(ctx, r.lockedKey(r.sid), ikey)
-				}
-				return nil
-			})
+					return nil
+				})
+			} else {
+				err = tx.HDel(ctx, ikey, lkey).Err()
+			}
 			return err
 		}, ikey))
 	}
@@ -63,11 +65,7 @@ func (r *redisMeta) Flock(ctx Context, inode Ino, owner uint64, ltype uint32, bl
 						return syscall.EAGAIN
 					}
 				}
-				_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-					pipe.HSet(ctx, ikey, lkey, "R")
-					return nil
-				})
-				return err
+				return tx.HSet(ctx, ikey, lkey, "R").Err()
 			}
 			if len(owners) > 0 {
 				return syscall.EAGAIN

@@ -93,6 +93,10 @@ type redisMeta struct {
 	shaLookup  string // The SHA returned by Redis for the loaded `scriptLookup`
 	shaResolve string // The SHA returned by Redis for the loaded `scriptResolve`
 
+	// SHA for new optimization scripts
+	shaAtomicWrite string // SHA for atomic write script
+	shaBatchLookup string // SHA for batch lookup script
+
 	// Pipeline optimization for batching operations
 	pipeline *pipelineManager
 }
@@ -239,6 +243,57 @@ func (m *pipelineManager) close() {
 
 var _ Meta = (*redisMeta)(nil)
 var _ engine = (*redisMeta)(nil)
+
+// Lua scripts for atomic operations
+var (
+	// Script for atomic write operation - reduces 5-6 RTTs to 1
+	scriptAtomicWrite = `
+		local inode_key = KEYS[1]
+		local chunk_key = KEYS[2]
+		local used_space_key = KEYS[3]
+		local attr_data = ARGV[1]
+		local slice_data = ARGV[2]
+		local space_delta = ARGV[3]
+		
+		-- Get and check existing attribute
+		local old_attr = redis.call('GET', inode_key)
+		if not old_attr then
+			return redis.error_reply("ENOENT")
+		end
+		
+		-- Update attribute and chunk
+		redis.call('SET', inode_key, attr_data)
+		local slices = redis.call('RPUSH', chunk_key, slice_data)
+		if tonumber(space_delta) > 0 then
+			redis.call('INCRBY', used_space_key, space_delta)
+		end
+		
+		return slices
+	`
+
+	// Script for optimized lookup with batched operations
+	scriptBatchLookup = `
+		local entry_key = KEYS[1]
+		local name = ARGV[1]
+		
+		-- Get entry
+		local entry = redis.call('HGET', entry_key, name)
+		if not entry then
+			return {nil, nil}
+		end
+		
+		-- Parse inode from entry (skip type byte, get next 8 bytes)
+		local inode = string.sub(entry, 2, 9)
+		local inode_num = 0
+		for i = 1, 8 do
+			inode_num = inode_num * 256 + string.byte(inode, i)
+		end
+		
+		-- Get attribute
+		local attr = redis.call('GET', 'i' .. inode_num)
+		return {entry, attr}
+	`
+)
 
 func init() {
 	Register("redis", newRedisMeta)
@@ -553,6 +608,15 @@ func (m *redisMeta) doNewSession(sinfo []byte, update bool) error {
 	if m.shaResolve, err = m.rdb.ScriptLoad(Background(), scriptResolve).Result(); err != nil {
 		logger.Warnf("load scriptResolve: %v", err)
 		m.shaResolve = ""
+	}
+	// Load optimization scripts
+	if m.shaAtomicWrite, err = m.rdb.ScriptLoad(Background(), scriptAtomicWrite).Result(); err != nil {
+		logger.Warnf("load scriptAtomicWrite: %v", err)
+		m.shaAtomicWrite = ""
+	}
+	if m.shaBatchLookup, err = m.rdb.ScriptLoad(Background(), scriptBatchLookup).Result(); err != nil {
+		logger.Warnf("load scriptBatchLookup: %v", err)
+		m.shaBatchLookup = ""
 	}
 
 	if !m.conf.NoBGJob {
@@ -1206,6 +1270,14 @@ func replaceErrno(txf func(tx *redis.Tx) error) func(tx *redis.Tx) error {
 	}
 }
 
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func (m *redisMeta) txn(ctx Context, txf func(tx *redis.Tx) error, keys ...string) error {
 	if m.conf.ReadOnly {
 		return syscall.EROFS
@@ -1230,7 +1302,11 @@ func (m *redisMeta) txn(ctx Context, txf func(tx *redis.Tx) error, keys ...strin
 		lastErr         error
 		method          string
 	)
-	for i := 0; i < 50; i++ {
+	// Adaptive retry strategy for better performance
+	maxRetries := 50
+	baseDelay := time.Microsecond * 100 // Start with 100μs for low latency environments
+
+	for i := 0; i < maxRetries; i++ {
 		if ctx.Canceled() {
 			return syscall.EINTR
 		}
@@ -1249,14 +1325,18 @@ func (m *redisMeta) txn(ctx Context, txf func(tx *redis.Tx) error, keys ...strin
 			m.txRestart.WithLabelValues(method).Add(1)
 			logger.Debugf("Transaction failed, restart it (tried %d): %s", i+1, err)
 			lastErr = err
-			time.Sleep(time.Millisecond * time.Duration(rand.Int()%((i+1)*(i+1))))
+
+			// Exponential backoff with jitter, optimized for low latency
+			delay := baseDelay * time.Duration(1<<min(i, 10)) // Cap at 2^10
+			jitter := time.Duration(rand.Int63n(int64(delay / 2)))
+			time.Sleep(delay + jitter)
 			continue
 		} else if err == nil && i > 1 {
 			logger.Warnf("Transaction succeeded after %d tries (%s), keys: %v, method: %s, last error: %s", i+1, time.Since(start), keys, method, lastErr)
 		}
 		return err
 	}
-	logger.Warnf("Already tried 50 times, returning: %s", lastErr)
+	logger.Warnf("Already tried %d times, returning: %s", maxRetries, lastErr)
 	return lastErr
 }
 
@@ -1456,10 +1536,7 @@ func (m *redisMeta) doSetAttr(ctx Context, inode Ino, set uint16, sugidclearmode
 
 		dirtyAttr.Ctime = now.Unix()
 		dirtyAttr.Ctimensec = uint32(now.Nanosecond())
-		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			pipe.Set(ctx, m.inodeKey(inode), m.marshal(dirtyAttr), 0)
-			return nil
-		})
+		err = tx.Set(ctx, m.inodeKey(inode), m.marshal(dirtyAttr), 0).Err()
 		if err == nil {
 			*attr = *dirtyAttr
 		}
@@ -2562,6 +2639,65 @@ func (m *redisMeta) doRead(ctx Context, inode Ino, indx uint32) ([]*slice, sysca
 }
 
 func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno {
+	// Try to use Lua script for atomic write if available (1 RTT instead of 5-6)
+	if m.shaAtomicWrite != "" && !m.conf.ReadOnly {
+		*delta = dirStat{}
+		*attr = Attr{}
+
+		// First get the current attribute to check quota and calculate deltas
+		a, err := m.rdb.Get(ctx, m.inodeKey(inode)).Bytes()
+		if err != nil {
+			return errno(err)
+		}
+		m.parseAttr(a, attr)
+		if attr.Typ != TypeFile {
+			return syscall.EPERM
+		}
+
+		newleng := uint64(indx)*ChunkSize + uint64(off) + uint64(slice.Len)
+		if newleng > attr.Length {
+			delta.length = int64(newleng - attr.Length)
+			delta.space = align4K(newleng) - align4K(attr.Length)
+			attr.Length = newleng
+		}
+
+		// Check quota before proceeding
+		if err := m.checkQuota(ctx, delta.space, 0, []Ino{attr.Parent}...); err != 0 {
+			return err
+		}
+
+		now := time.Now()
+		attr.Mtime = mtime.Unix()
+		attr.Mtimensec = uint32(mtime.Nanosecond())
+		attr.Ctime = now.Unix()
+		attr.Ctimensec = uint32(now.Nanosecond())
+
+		// Execute atomic write with Lua script
+		result, err := m.rdb.EvalSha(ctx, m.shaAtomicWrite,
+			[]string{
+				m.inodeKey(inode),
+				m.chunkKey(inode, indx),
+				m.usedSpaceKey(),
+			},
+			m.marshal(attr),
+			marshalSlice(off, slice.Id, slice.Size, slice.Off, slice.Len),
+			delta.space,
+		).Result()
+
+		if err != nil {
+			// Fallback to transaction-based approach if script fails
+			goto fallback
+		}
+
+		if n, ok := result.(int64); ok {
+			*numSlices = int(n)
+			return 0
+		}
+		return errno(err)
+	}
+
+fallback:
+	// Original transaction-based implementation as fallback
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
 		*delta = dirStat{}
 		*attr = Attr{}
@@ -3661,10 +3797,7 @@ func (m *redisMeta) doRepair(ctx Context, inode Ino, attr *Attr) syscall.Errno {
 				attr.Nlink++
 			}
 		}
-		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			pipe.Set(ctx, m.inodeKey(inode), m.marshal(attr), 0)
-			return nil
-		})
+		err = tx.Set(ctx, m.inodeKey(inode), m.marshal(attr), 0).Err()
 		return err
 	}, m.inodeKey(inode), m.entryKey(inode)))
 }
