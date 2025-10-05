@@ -92,6 +92,149 @@ type redisMeta struct {
 	prefix     string
 	shaLookup  string // The SHA returned by Redis for the loaded `scriptLookup`
 	shaResolve string // The SHA returned by Redis for the loaded `scriptResolve`
+
+	// Pipeline optimization for batching operations
+	pipeline *pipelineManager
+}
+
+// Pipeline optimization structures for batching Redis operations
+type pipelineManager struct {
+	sync.Mutex
+	rdb         redis.UniversalClient
+	batchSize   int
+	maxWaitTime time.Duration
+	operations  chan *pipelineOp
+	wg          sync.WaitGroup
+	enabled     bool
+}
+
+type pipelineOp struct {
+	exec   func(pipe redis.Pipeliner) error
+	result chan error
+}
+
+func newPipelineManager(rdb redis.UniversalClient, enabled bool) *pipelineManager {
+	m := &pipelineManager{
+		rdb:         rdb,
+		batchSize:   50,                   // Batch up to 50 operations for better throughput
+		maxWaitTime: 5 * time.Millisecond, // Very short wait to minimize latency
+		operations:  make(chan *pipelineOp, 200),
+		enabled:     enabled,
+	}
+	if enabled {
+		m.wg.Add(1)
+		go m.processPipeline()
+		logger.Infof("Redis pipelining enabled: batch_size=%d, max_wait=%v", m.batchSize, m.maxWaitTime)
+	}
+	return m
+}
+
+func (m *pipelineManager) processPipeline() {
+	defer m.wg.Done()
+
+	batch := make([]*pipelineOp, 0, m.batchSize)
+	timer := time.NewTimer(m.maxWaitTime)
+	timer.Stop()
+
+	flushBatch := func() {
+		if len(batch) == 0 {
+			return
+		}
+
+		// Execute all operations in a single pipeline
+		pipe := m.rdb.Pipeline()
+		for _, op := range batch {
+			if err := op.exec(pipe); err != nil {
+				op.result <- err
+				close(op.result)
+				continue
+			}
+		}
+
+		// Execute the pipeline
+		cmds, err := pipe.Exec(Background())
+
+		// Map results back to operations
+		for i, op := range batch {
+			resultErr := err
+			if err == nil && i < len(cmds) {
+				// Check individual command errors
+				if cmdErr := cmds[i].Err(); cmdErr != nil && cmdErr != redis.Nil {
+					resultErr = cmdErr
+				}
+			}
+			select {
+			case op.result <- resultErr:
+			default:
+			}
+			close(op.result)
+		}
+
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case op, ok := <-m.operations:
+			if !ok {
+				flushBatch()
+				return
+			}
+
+			batch = append(batch, op)
+
+			// Start timer on first operation
+			if len(batch) == 1 {
+				timer.Reset(m.maxWaitTime)
+			}
+
+			// Flush if batch is full
+			if len(batch) >= m.batchSize {
+				timer.Stop()
+				flushBatch()
+			}
+
+		case <-timer.C:
+			flushBatch()
+		}
+	}
+}
+
+func (m *pipelineManager) execute(exec func(pipe redis.Pipeliner) error) error {
+	if !m.enabled {
+		// Fallback to direct execution if pipelining is disabled
+		pipe := m.rdb.Pipeline()
+		if err := exec(pipe); err != nil {
+			return err
+		}
+		_, err := pipe.Exec(Background())
+		return err
+	}
+
+	op := &pipelineOp{
+		exec:   exec,
+		result: make(chan error, 1),
+	}
+
+	select {
+	case m.operations <- op:
+		return <-op.result
+	case <-time.After(50 * time.Millisecond):
+		// Fallback to direct execution if pipeline is congested
+		pipe := m.rdb.Pipeline()
+		if err := exec(pipe); err != nil {
+			return err
+		}
+		_, err := pipe.Exec(Background())
+		return err
+	}
+}
+
+func (m *pipelineManager) close() {
+	if m.enabled {
+		close(m.operations)
+		m.wg.Wait()
+	}
 }
 
 var _ Meta = (*redisMeta)(nil)
@@ -118,6 +261,7 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 	writeTimeout := query.duration("write-timeout", "write_timeout", time.Second*5)
 	routeRead := query.pop("route-read")
 	skipVerify := query.pop("insecure-skip-verify")
+	enablePipelining := query.pop("enable-pipelining") != "" // Enable with ?enable-pipelining=true
 	certFile := query.pop("tls-cert-file")
 	keyFile := query.pop("tls-key-file")
 	caCertFile := query.pop("tls-ca-cert-file")
@@ -259,16 +403,30 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 		rdb:      rdb,
 		prefix:   prefix,
 	}
+
+	// Initialize pipeline manager (can be enabled via URL parameter)
+	m.pipeline = newPipelineManager(rdb, enablePipelining)
+
 	m.en = m
 	m.checkServerConfig()
 	return m, nil
 }
 
 func (m *redisMeta) Shutdown() error {
+	if m.pipeline != nil {
+		m.pipeline.close()
+	}
 	return m.rdb.Close()
 }
 
 func (m *redisMeta) doDeleteSlice(id uint64, size uint32) error {
+	// For single deletes, batch them through the pipeline if enabled
+	if m.pipeline != nil && m.pipeline.enabled {
+		return m.pipeline.execute(func(pipe redis.Pipeliner) error {
+			pipe.HDel(Background(), m.sliceRefs(), m.sliceKey(id, size))
+			return nil
+		})
+	}
 	return m.rdb.HDel(Background(), m.sliceRefs(), m.sliceKey(id, size)).Err()
 }
 
